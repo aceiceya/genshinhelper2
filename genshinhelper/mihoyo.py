@@ -9,7 +9,7 @@ import random
 import time
 
 from .core import Client, get_headers
-from .utils import request, log, nested_lookup, extract_subset_of_dict, merge_dicts, cookie_to_dict, _
+from .utils import request, log, nested_lookup, extract_subset_of_dict, merge_dicts, cookie_to_dict, get_device_id, _
 
 
 class YuanShen(Client):
@@ -51,10 +51,25 @@ class YuanShen(Client):
     @property
     def travelers_dairy(self):
         roles_info = self.roles_info
+        """
         self._travelers_dairy = [
             self.get_travelers_dairy(i['game_uid'], i['region'])
             for i in roles_info
         ]
+        """
+        """
+        修复等级不足10级时无法查看旅行者札记(无法获取每个月获得的摩拉原石数量)
+        导致 _tp 为None
+        使 genshin-checkin-help 中会出现`list index out of range`的bug
+        """
+        self._travelers_dairy = []
+        for i in roles_info:
+            _tp = self.get_travelers_dairy(i['game_uid'], i['region'])
+            if _tp is None:
+                self._travelers_dairy.append({'month_data': {}})
+            else:
+                self._travelers_dairy.append(_tp)
+
         return self._travelers_dairy
 
     def get_travelers_dairy(self, uid: str, region: str, month: int = 0):
@@ -95,15 +110,16 @@ class YuanShen(Client):
 class Honkai3rd(Client):
     def __init__(self, cookie: str = None):
         super().__init__(cookie)
-        self.act_id = 'ea20211026151532'
+        self.act_id = 'e202207181446311'
         self.game_biz = 'bh3_cn'
         self.required_keys.update({
             'total_sign_day', 'today', 'is_sign', 'first_bind',
             'month_hcoin', 'month_star'
         })
 
-        self.rewards_info_url = f'{self.api}/common/eutheniav2/index?act_id={self.act_id}' + '&uid={}&region={}'
-        self.sign_url = f'{self.api}/common/eutheniav2/sign'
+        self.sign_info_url = f'{self.api}/event/luna/info?act_id={self.act_id}' + '&uid={}&region={}'
+        self.rewards_info_url = f'{self.api}/event/luna/home?act_id={self.act_id}'
+        self.sign_url = f'{self.api}/event/luna/sign'
 
         self._bh3_finance = None
         self.bh3_finance_url = 'https://api.mihoyo.com/bh3-weekly_finance/api/index?bind_uid={}&bind_region={}&game_biz=bh3_cn'
@@ -111,30 +127,19 @@ class Honkai3rd(Client):
     @property
     def sign_info(self):
         if not self._sign_info:
-            rewards_info = self.rewards_info
-            for i in rewards_info:
-                # 0: can not check in
-                # 1: can check in
-                # 2: already checked in
-                current_day = len(i) - nested_lookup(i, 'status').count(0)
-                is_sign = True if i[current_day - 1]['status'] == 2 else False
-                self._sign_info.append({
-                    'total_sign_day': nested_lookup(i, 'status').count(2),
-                    'is_sign': is_sign
-                })
+            roles_info = self.roles_info
+            self._sign_info = [
+                self.get_sign_info(i['game_uid'], i['region'])
+                for i in roles_info
+            ]
         return self._sign_info
 
-    @property
-    def rewards_info(self):
-        if not self._rewards_info:
-            log.info(_('Preparing to get monthly rewards information ...'))
-            roles_info = self.roles_info
-            for i in roles_info:
-                url = self.rewards_info_url.format(i['game_uid'], i['region'])
-                response = request('get', url, headers=self.headers, cookies=self.cookie).json()
-                log.debug(response)
-                self._rewards_info.append(nested_lookup(response, 'list', fetch_first=True))
-        return self._rewards_info
+    def get_sign_info(self, uid: str, region: str):
+        log.info(_('Preparing to get check-in information ...'))
+        url = self.sign_info_url.format(uid, region)
+        response = request('get', url, headers=self.headers, cookies=self.cookie).json()
+        data = nested_lookup(response, 'data', fetch_first=True)
+        return extract_subset_of_dict(data, self.required_keys)
 
     @property
     def bh3_finance(self):
@@ -166,7 +171,7 @@ class MysDailyMissions(object):
         self.cookie = cookie_to_dict(cookie)
         self.api = 'https://bbs-api.mihoyo.com'
         self.state_url = f'{self.api}/apihub/sapi/getUserMissionsState'
-        self.sign_url = f'{self.api}/apihub/sapi/signIn' + '?gids={}'
+        self.sign_url = f'{self.api}/apihub/app/api/signIn'
         self.post_list_url = f'{self.api}/post/api/getForumPostList?&is_good=false&is_hot=false&page_size=20&sort_type=1' + '&forum_id={}'
         self.post_full_url = f'{self.api}/post/api/getPostFull' + '?post_id={}'
         self.upvote_url = f'{self.api}/apihub/sapi/upvotePost'
@@ -192,7 +197,8 @@ class MysDailyMissions(object):
         headers.update({
             'User-Agent': 'okhttp/4.8.0',
             'Referer': 'https://app.mihoyo.com',
-            'x-rpc-channel': 'miyousheluodi'
+            'x-rpc-channel': 'miyousheluodi',
+            'x-rpc-device_id': get_device_id(str(self.cookie)),
         })
         return headers
 
@@ -222,8 +228,16 @@ class MysDailyMissions(object):
             raise ValueError(f'The value of game_id is one of {self.game_ids}')
 
         log.info(_('Preparing to check-in for {} ...').format(self.game_ids_dict[game_id]))
-        url = self.sign_url.format(game_id)
-        response = request('post', url, headers=self.headers, cookies=self.cookie).json()
+        url = self.sign_url
+        data = {'gids': str(game_id)}
+        headers = get_headers(with_ds=True, ds_type='android_new', data=data)
+        headers.update({
+            'User-Agent': 'okhttp/4.8.0',
+            'Referer': 'https://app.mihoyo.com',
+            'x-rpc-channel': 'miyousheluodi',
+            'x-rpc-device_id': get_device_id(str(self.cookie)),
+        })
+        response = request('post', url, json=data, headers=headers, cookies=self.cookie).json()
         message = response.get('message')
         result = {'name': self.game_ids_dict[game_id], 'message': message}
         self.result['sign'].append(result)
@@ -237,7 +251,7 @@ class MysDailyMissions(object):
 
         log.info(_('Preparing to get posts of {} ...').format(self.forum_ids_dict[forum_id]))
         url = self.post_list_url.format(forum_id)
-        response = request('get', url).json()
+        response = request('get', url, headers=self.headers, cookies=self.cookie).json()
         post_list = nested_lookup(response, 'list', fetch_first=True)
         posts = [{
             'post_id': nested_lookup(post, 'post_id', fetch_first=True),
@@ -284,7 +298,7 @@ class MysDailyMissions(object):
         [self.sign(i) for i in self.game_ids if not state['is_sign']]
 
         posts = self.get_posts(forum_id)
-        [self.view_post(i) for i in random.sample(posts[0:5], 3) if not state['is_view']]
+        [self.view_post(i) for i in random.sample(posts[0:8], 5) if not state['is_view']]
         [self.upvote_post(i) for i in random.sample(posts[5:17], 10) if not state['is_upvote']]
         [self.share_post(i) for i in random.sample(posts[-3:-1], 1) if not state['is_share']]
 
